@@ -36,8 +36,12 @@ local C_Item_IsItemInRange = C_Item.IsItemInRange
 local C_Item_IsUsableItem = C_Item.IsUsableItem
 local C_QuestLog_GetNumQuestLogEntries = C_QuestLog.GetNumQuestLogEntries
 local C_Timer_NewTicker = C_Timer.NewTicker
+local C_Timer_NewTimer = C_Timer.NewTimer
 local C_TradeSkillUI_GetItemCraftedQualityByItemInfo = C_TradeSkillUI.GetItemCraftedQualityByItemInfo
 local C_TradeSkillUI_GetItemReagentQualityByItemInfo = C_TradeSkillUI.GetItemReagentQualityByItemInfo
+
+-- Throttle interval for per-button OnUpdate logic (seconds)
+local BUTTON_UPDATE_THROTTLE = 0.15
 
 local questItemList = {}
 local function UpdateQuestItemList()
@@ -252,7 +256,10 @@ function EB:SetUpButton(button, itemData, slotID, waitGroup)
 	-- OnUpdate
 	local OnUpdateFunction
 	if button.itemID then
-		OnUpdateFunction = function(self)
+		OnUpdateFunction = function(self, elapsed)
+			self._throttle = (self._throttle or 0) + (elapsed or 0)
+			if self._throttle < BUTTON_UPDATE_THROTTLE then return end
+			self._throttle = 0
 			local start, duration, enable
 			if self.questLogIndex and self.questLogIndex > 0 then
 				start, duration, enable = GetQuestLogSpecialItemCooldown(self.questLogIndex)
@@ -269,7 +276,10 @@ function EB:SetUpButton(button, itemData, slotID, waitGroup)
 			end
 		end
 	elseif button.slotID then
-		OnUpdateFunction = function(self)
+		OnUpdateFunction = function(self, elapsed)
+			self._throttle = (self._throttle or 0) + (elapsed or 0)
+			if self._throttle < BUTTON_UPDATE_THROTTLE then return end
+			self._throttle = 0
 			local start, duration, enable = GetInventoryItemCooldown("player", self.slotID)
 			CooldownFrame_Set(self.cooldown, start, duration, enable)
 		end
@@ -551,34 +561,38 @@ function EB:UpdateBar(id)
 		end
 	end
 
-	local function addNormalButtons(list)
-		for _, itemID in pairs(list) do
-			addNormalButton(itemID)
-		end
-	end
+    local function addNormalButtons(list)
+        for _, itemID in pairs(list) do
+            if buttonID > barDB.numButtons then break end
+            addNormalButton(itemID)
+        end
+    end
 
 	for _, module in ipairs({ strsplit("[, ]", barDB.include) }) do
 		if buttonID <= barDB.numButtons then
 			if self.moduleList[module] then
 				addNormalButtons(self.moduleList[module])
-			elseif module == "QUEST" then -- Quest Items
-				for _, data in pairs(questItemList) do
-					addNormalButton(data.itemID)
-				end
-			elseif module == "EQUIP" then -- Equipments
-				for _, slotID in pairs(equipmentList) do
-					addSlotButton(slotID)
-				end
-			elseif strmatch(module, "^SLOT:") then -- Equipments filtered by slot ID
-				local slotFilter = strmatch(module, "^SLOT:(.+)$")
-				local allowedSlots = ParseSlotFilter(slotFilter)
-				if allowedSlots then
-					for _, slotID in pairs(equipmentList) do
-						if allowedSlots[slotID] then
-							addSlotButton(slotID)
-						end
-					end
-				end
+            elseif module == "QUEST" then -- Quest Items
+                for _, data in pairs(questItemList) do
+                    if buttonID > barDB.numButtons then break end
+                    addNormalButton(data.itemID)
+                end
+            elseif module == "EQUIP" then -- Equipments
+                for _, slotID in pairs(equipmentList) do
+                    if buttonID > barDB.numButtons then break end
+                    addSlotButton(slotID)
+                end
+            elseif strmatch(module, "^SLOT:") then -- Equipments filtered by slot ID
+                local slotFilter = strmatch(module, "^SLOT:(.+)$")
+                local allowedSlots = ParseSlotFilter(slotFilter)
+                if allowedSlots then
+                    for _, slotID in pairs(equipmentList) do
+                        if buttonID > barDB.numButtons then break end
+                        if allowedSlots[slotID] then
+                            addSlotButton(slotID)
+                        end
+                    end
+                end
 			elseif module == "CUSTOM" then -- Custom Items
 				addNormalButtons(self.db.customList)
 			end
@@ -736,11 +750,33 @@ function EB:UpdateBars()
 	end
 end
 
+-- Debounced update handlers to reduce stutter during rapid events
+function EB:OnBagUpdateDelayed()
+    if self._bagUpdateTimer then
+        self._bagUpdateTimer:Cancel()
+    end
+    self._bagUpdateTimer = C_Timer_NewTimer(0.05, function()
+        self._bagUpdateTimer = nil
+        self:UpdateBars()
+    end)
+end
+
+function EB:OnQuestChanged()
+    if self._questUpdateTimer then
+        self._questUpdateTimer:Cancel()
+    end
+    self._questUpdateTimer = C_Timer_NewTimer(0.10, function()
+        self._questUpdateTimer = nil
+        UpdateQuestItemList()
+        self:UpdateBars()
+    end)
+end
+
 do
-	local lastUpdateTime = 0
-	function EB:UNIT_INVENTORY_CHANGED()
-		local now = GetTime()
-		if now - lastUpdateTime < 0.25 then
+    local lastUpdateTime = 0
+    function EB:UNIT_INVENTORY_CHANGED()
+        local now = GetTime()
+        if now - lastUpdateTime < 0.25 then
 			return
 		end
 		lastUpdateTime = now
@@ -815,19 +851,19 @@ function EB:Initialize()
 	self:UpdateBars()
 	self:UpdateBinding()
 
-	self:RegisterEvent("BAG_UPDATE_DELAYED", "UpdateBars")
-	self:RegisterEvent("ITEM_LOCKED")
-	self:RegisterEvent("PLAYER_ALIVE", "UpdateBars")
-	self:RegisterEvent("PLAYER_EQUIPMENT_CHANGED", "UpdateEquipmentItem")
-	self:RegisterEvent("PLAYER_UNGHOST", "UpdateBars")
-	self:RegisterEvent("QUEST_ACCEPTED", "UpdateQuestItem")
-	self:RegisterEvent("QUEST_LOG_UPDATE", "UpdateQuestItem")
-	self:RegisterEvent("QUEST_TURNED_IN", "UpdateQuestItem")
-	self:RegisterEvent("QUEST_WATCH_LIST_CHANGED", "UpdateQuestItem")
-	self:RegisterEvent("UNIT_INVENTORY_CHANGED")
-	self:RegisterEvent("UPDATE_BINDINGS", "UpdateBinding")
-	self:RegisterEvent("ZONE_CHANGED", "UpdateBars")
-	self:RegisterEvent("ZONE_CHANGED_NEW_AREA", "UpdateBars")
+    self:RegisterEvent("BAG_UPDATE_DELAYED", "OnBagUpdateDelayed")
+    self:RegisterEvent("ITEM_LOCKED")
+    self:RegisterEvent("PLAYER_ALIVE", "UpdateBars")
+    self:RegisterEvent("PLAYER_EQUIPMENT_CHANGED", "UpdateEquipmentItem")
+    self:RegisterEvent("PLAYER_UNGHOST", "UpdateBars")
+    self:RegisterEvent("QUEST_ACCEPTED", "OnQuestChanged")
+    self:RegisterEvent("QUEST_LOG_UPDATE", "OnQuestChanged")
+    self:RegisterEvent("QUEST_TURNED_IN", "OnQuestChanged")
+    self:RegisterEvent("QUEST_WATCH_LIST_CHANGED", "OnQuestChanged")
+    self:RegisterEvent("UNIT_INVENTORY_CHANGED")
+    self:RegisterEvent("UPDATE_BINDINGS", "UpdateBinding")
+    self:RegisterEvent("ZONE_CHANGED", "UpdateBars")
+    self:RegisterEvent("ZONE_CHANGED_NEW_AREA", "UpdateBars")
 
 	self.initialized = true
 end
