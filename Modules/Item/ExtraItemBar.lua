@@ -38,6 +38,9 @@ local C_QuestLog_GetNumQuestLogEntries = C_QuestLog.GetNumQuestLogEntries
 local C_Timer_NewTicker = C_Timer.NewTicker
 local C_TradeSkillUI_GetItemCraftedQualityByItemInfo = C_TradeSkillUI.GetItemCraftedQualityByItemInfo
 local C_TradeSkillUI_GetItemReagentQualityByItemInfo = C_TradeSkillUI.GetItemReagentQualityByItemInfo
+local C_Container = C_Container
+local C_Container_GetContainerNumSlots = C_Container and C_Container.GetContainerNumSlots
+local C_Container_GetContainerItemInfo = C_Container and C_Container.GetContainerItemInfo
 
 local questItemList = {}
 local function UpdateQuestItemList()
@@ -103,6 +106,83 @@ local UpdateAfterCombat = {
 	[2] = false,
 	[3] = false,
 }
+
+local function BuildBagSlotList()
+	local bagIDs = {}
+
+	for bagID = 0, NUM_BAG_SLOTS do
+		bagIDs[#bagIDs + 1] = bagID
+	end
+
+	local reagentBagID = Enum and Enum.BagIndex and Enum.BagIndex.ReagentBag
+	if reagentBagID then
+		bagIDs[#bagIDs + 1] = reagentBagID
+	elseif type(REAGENT_BAG_INDEX) == "number" then
+		bagIDs[#bagIDs + 1] = REAGENT_BAG_INDEX
+	end
+
+	return bagIDs
+end
+
+EB.bagIDs = BuildBagSlotList()
+
+function EB:RebuildOwnedItemCache()
+	local counts = self.ownedItemCounts
+	if not counts then
+		counts = {}
+		self.ownedItemCounts = counts
+	end
+
+	local canScan = C_Container_GetContainerNumSlots and C_Container_GetContainerItemInfo and self.bagIDs
+	self.useBagCache = not not canScan
+	if not canScan then
+		return counts
+	end
+
+	wipe(counts)
+
+	for _, bagID in ipairs(self.bagIDs) do
+		local numSlots = C_Container_GetContainerNumSlots(bagID)
+		if numSlots and numSlots > 0 then
+			for slot = 1, numSlots do
+				local info = C_Container_GetContainerItemInfo(bagID, slot)
+				if info and info.itemID then
+					local stack = info.stackCount or 1
+					counts[info.itemID] = (counts[info.itemID] or 0) + stack
+				end
+			end
+		end
+	end
+
+	return counts
+end
+
+function EB:ScheduleUpdate(immediate)
+	if type(immediate) ~= "boolean" then
+		immediate = false
+	end
+
+	if immediate then
+		self.pendingUpdate = nil
+		self.updateScheduled = nil
+		self:UpdateBars()
+		return
+	end
+
+	self.pendingUpdate = true
+	if self.updateScheduled then
+		return
+	end
+
+	self.updateScheduled = true
+	E:Delay(0.12, function()
+		self.updateScheduled = nil
+		if self.pendingUpdate then
+			self.pendingUpdate = nil
+			self:UpdateBars()
+		end
+	end)
+end
 
 do
 	local fakeButton = {
@@ -205,7 +285,11 @@ function EB:SetUpButton(button, itemData, slotID, waitGroup)
 
 	if itemData then
 		button.itemID = itemData.itemID
-		button.countText = C_Item_GetItemCount(itemData.itemID, nil, true)
+		local countOverride = itemData.countOverride
+		if countOverride == nil then
+			countOverride = C_Item_GetItemCount(itemData.itemID, nil, true)
+		end
+		button.countText = countOverride
 		button.questLogIndex = itemData.questLogIndex
 		button:SetBackdropBorderColor(0, 0, 0)
 
@@ -480,21 +564,34 @@ function EB:CreateBar(id)
 	self.bars[id] = bar
 end
 
-function EB:ValidateItem(itemID)
-	if not itemID then
+function EB:ValidateItem(itemID, countOverride)
+	if not itemID or not self.db then
 		return false
 	end
 
-	if self.db.blackList[itemID] then
+	local blackList = self.db.blackList
+	if blackList and blackList[itemID] then
 		return false
 	end
 
-	if self.StateCheckList[itemID] and not self:GetState(self.StateCheckList[itemID]) then
+	local stateCheckList = self.StateCheckList
+	if stateCheckList and stateCheckList[itemID] and not self:GetState(stateCheckList[itemID]) then
 		return false
 	end
 
-	local count = C_Item_GetItemCount(itemID)
-	local countThreshold = self.CountThreshold[itemID] or 1
+	local count = countOverride
+	if count == nil and self.useBagCache and self.ownedItemCounts then
+		count = self.ownedItemCounts[itemID]
+	end
+
+	if count == nil then
+		count = C_Item_GetItemCount(itemID)
+		if self.ownedItemCounts and count then
+			self.ownedItemCounts[itemID] = count
+		end
+	end
+
+	local countThreshold = (self.CountThreshold and self.CountThreshold[itemID]) or 1
 	if not count or count < countThreshold then
 		return false
 	end
@@ -532,11 +629,59 @@ function EB:UpdateBar(id)
 		return
 	end
 
+	if not self.ownedItemCounts then
+		self:RebuildOwnedItemCache()
+	end
+	local ownedCounts = self.ownedItemCounts
+	local useBagCache = self.useBagCache
+
 	local buttonID = 1
 
-	local function addNormalButton(itemID)
-		if self:ValidateItem(itemID) and buttonID <= barDB.numButtons then
-			self:SetUpButton(bar.buttons[buttonID], { itemID = itemID }, nil, bar.waitGroup)
+	local function getCountOverride(itemID, itemData)
+		if itemData and itemData.questLogIndex then
+			return itemData.countOverride or 1, false
+		end
+
+		if ownedCounts then
+			local ownedCount = ownedCounts[itemID]
+			if useBagCache then
+				if not ownedCount or ownedCount <= 0 then
+					return ownedCount or 0, true
+				end
+				return ownedCount, false
+			elseif ownedCount ~= nil then
+				return ownedCount, ownedCount <= 0
+			end
+		end
+
+		return nil, false
+	end
+
+	local function addNormalButton(itemID, itemData)
+		if buttonID > barDB.numButtons then
+			return
+		end
+
+		local countOverride, shouldSkip = getCountOverride(itemID, itemData)
+		if shouldSkip then
+			return
+		end
+
+		local data = itemData
+		if not data then
+			data = { itemID = itemID }
+		else
+			data.itemID = itemID
+		end
+
+		if countOverride ~= nil then
+			data.countOverride = countOverride
+		else
+			data.countOverride = nil
+		end
+
+		if self:ValidateItem(itemID, data.countOverride) then
+			self:SetUpButton(bar.buttons[buttonID], data, nil, bar.waitGroup)
 			self:UpdateButtonSize(bar.buttons[buttonID], barDB)
 			buttonID = buttonID + 1
 		end
@@ -563,7 +708,7 @@ function EB:UpdateBar(id)
 				addNormalButtons(self.moduleList[module])
 			elseif module == "QUEST" then -- Quest Items
 				for _, data in pairs(questItemList) do
-					addNormalButton(data.itemID)
+					addNormalButton(data.itemID, data)
 				end
 			elseif module == "EQUIP" then -- Equipments
 				for _, slotID in pairs(equipmentList) do
@@ -731,9 +876,20 @@ end
 
 function EB:UpdateBars()
 	self:UpdateState(EB.STATE.IN_DELVE)
+	if self.db and self.db.enable then
+		self:RebuildOwnedItemCache()
+	elseif self.ownedItemCounts then
+		wipe(self.ownedItemCounts)
+		self.useBagCache = nil
+	end
+
 	for i = 1, 5 do
 		self:UpdateBar(i)
 	end
+end
+
+function EB:RequestUpdate()
+	self:ScheduleUpdate(false)
 end
 
 do
@@ -747,18 +903,18 @@ do
 		UpdateQuestItemList()
 		UpdateEquipmentList()
 
-		self:UpdateBars()
+		self:ScheduleUpdate(false)
 	end
 end
 
 function EB:UpdateQuestItem()
 	UpdateQuestItemList()
-	self:UpdateBars()
+	self:ScheduleUpdate(false)
 end
 
 function EB:UpdateEquipmentItem()
 	UpdateEquipmentList()
-	self:UpdateBars()
+	self:ScheduleUpdate(false)
 end
 
 do
@@ -771,7 +927,7 @@ do
 		InUpdating = true
 		E:Delay(1, function()
 			UpdateEquipmentList()
-			self:UpdateBars()
+			self:ScheduleUpdate(false)
 			InUpdating = false
 		end)
 	end
@@ -812,22 +968,22 @@ function EB:Initialize()
 	self:CreateAll()
 	UpdateQuestItemList()
 	UpdateEquipmentList()
-	self:UpdateBars()
+	self:ScheduleUpdate(true)
 	self:UpdateBinding()
 
-	self:RegisterEvent("BAG_UPDATE_DELAYED", "UpdateBars")
+	self:RegisterEvent("BAG_UPDATE_DELAYED", "RequestUpdate")
 	self:RegisterEvent("ITEM_LOCKED")
-	self:RegisterEvent("PLAYER_ALIVE", "UpdateBars")
+	self:RegisterEvent("PLAYER_ALIVE", "RequestUpdate")
 	self:RegisterEvent("PLAYER_EQUIPMENT_CHANGED", "UpdateEquipmentItem")
-	self:RegisterEvent("PLAYER_UNGHOST", "UpdateBars")
+	self:RegisterEvent("PLAYER_UNGHOST", "RequestUpdate")
 	self:RegisterEvent("QUEST_ACCEPTED", "UpdateQuestItem")
 	self:RegisterEvent("QUEST_LOG_UPDATE", "UpdateQuestItem")
 	self:RegisterEvent("QUEST_TURNED_IN", "UpdateQuestItem")
 	self:RegisterEvent("QUEST_WATCH_LIST_CHANGED", "UpdateQuestItem")
 	self:RegisterEvent("UNIT_INVENTORY_CHANGED")
 	self:RegisterEvent("UPDATE_BINDINGS", "UpdateBinding")
-	self:RegisterEvent("ZONE_CHANGED", "UpdateBars")
-	self:RegisterEvent("ZONE_CHANGED_NEW_AREA", "UpdateBars")
+	self:RegisterEvent("ZONE_CHANGED", "RequestUpdate")
+	self:RegisterEvent("ZONE_CHANGED_NEW_AREA", "RequestUpdate")
 
 	self.initialized = true
 end
@@ -853,7 +1009,7 @@ function EB:ProfileUpdate()
 		self:UnregisterEvent("ZONE_CHANGED_NEW_AREA")
 	end
 
-	self:UpdateBars()
+	self:ScheduleUpdate(true)
 end
 
 W:RegisterModule(EB:GetName())
